@@ -7,13 +7,23 @@ def trace_downstream(watermark_value: str, db_path: str | None = None) -> dict:
     if not value:
         raise ServiceError("水印值不能为空")
     with get_db(db_path) as conn:
-        sources = conn.execute(
-            "SELECT * FROM run_batches WHERE watermark_value=? ORDER BY id",
+        # 印记表是唯一事实来源：有效印记与死信里的印记都能被追索到。
+        hits = conn.execute(
+            "SELECT b.*, m.mark_value AS traced_value, m.state AS mark_state, "
+            "m.origin AS mark_origin, m.mark_seq AS mark_seq "
+            "FROM stamp_marks m JOIN run_batches b "
+            "ON b.id=m.batch_id AND b.run_code=m.run_code "
+            "WHERE m.mark_value=? ORDER BY b.id, m.mark_seq",
             (value,),
         ).fetchall()
-        if not sources:
+        if not hits:
             raise ServiceError("未找到该水印值的盖印批次", 404)
-        codes = [s["run_code"] for s in sources]
+        dead = conn.execute(
+            "SELECT * FROM dead_letters WHERE mark_value=? ORDER BY id",
+            (value,),
+        ).fetchall()
+        sources = [dict(h) for h in hits]
+        codes = sorted({h["run_code"] for h in hits})
         placeholders = ",".join("?" for _ in codes)
         edges = conn.execute(
             f"SELECT * FROM lineage_edges WHERE upstream_run_code IN ({placeholders})",
@@ -32,7 +42,8 @@ def trace_downstream(watermark_value: str, db_path: str | None = None) -> dict:
             ]
         return {
             "watermark_value": value,
-            "sources": [dict(s) for s in sources],
+            "sources": sources,
+            "dead_letters": [dict(d) for d in dead],
             "edges": [dict(e) for e in edges],
             "downstream": downstream,
         }
